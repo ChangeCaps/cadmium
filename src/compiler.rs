@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    panic,
+};
 
 use lasagna::{Span, Spanned};
 
 use crate::{
-    AssignStmt, BinaryExpr, BinaryOp, BlockStmt, Bool, Expr, IfStmt, Instruction, LetStmt,
-    Register, Stmt, TermExpr, Type, UnaryExpr, Word,
+    AssignStmt, BinaryExpr, BinaryOp, BlockStmt, BoolExpr, CallExpr, Expr, FnDecl, FnType, IfStmt,
+    Instruction, LetStmt, ModFn, Module, Register, ReturnStmt, Stmt, TermExpr, Type, UnaryExpr,
+    UnaryOp, Word,
 };
 
 #[derive(Clone, Debug)]
@@ -73,22 +77,25 @@ impl Registers {
     }
 
     #[inline]
-    pub fn allocated(&self) -> impl Iterator<Item = Register> {
+    pub fn allocated(&self) -> impl DoubleEndedIterator<Item = Register> {
         self.allocated.clone().into_iter()
     }
 }
 
+#[derive(Debug)]
 pub struct Value {
     pub ty: Type,
     pub deref: bool,
     pub reg: Register,
 }
 
+#[derive(Clone, Debug)]
 pub struct Variable {
     pub ty: Type,
     pub addr: u64,
 }
 
+#[derive(Clone, Debug)]
 pub struct Scope {
     /// Number of pushes made in this scope.
     pub local_size: u64,
@@ -97,6 +104,9 @@ pub struct Scope {
     pub stack_size: u64,
 
     pub variables: HashMap<String, Variable>,
+
+    pub return_type: Type,
+    pub returned: bool,
 }
 
 impl Scope {
@@ -106,7 +116,23 @@ impl Scope {
             local_size: 0,
             stack_size: 0,
             variables: HashMap::new(),
+            return_type: Type::Void,
+            returned: false,
         }
+    }
+
+    #[inline]
+    pub fn sub(&self) -> Self {
+        Self {
+            local_size: 0,
+            ..self.clone()
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self) {
+        self.local_size += 1;
+        self.stack_size += 1;
     }
 
     #[inline]
@@ -126,6 +152,11 @@ impl Block {
     #[inline]
     pub const fn from_u64(val: u64) -> Self {
         Self(val)
+    }
+
+    #[inline]
+    pub const fn to_u64(self) -> u64 {
+        self.0
     }
 }
 
@@ -155,8 +186,11 @@ impl CompiledBlock {
 pub struct Compiler {
     pub next_block: Block,
     pub blocks: BTreeMap<Block, CompiledBlock>,
+    pub finalized_blocks: Vec<Block>,
     pub current_block: Option<Block>,
+    pub externals: BTreeMap<u64, Block>,
     pub max_registers: u32,
+    pub module: Module,
 }
 
 impl Compiler {
@@ -165,9 +199,31 @@ impl Compiler {
         Self {
             next_block: Block(0),
             blocks: BTreeMap::new(),
+            finalized_blocks: Vec::new(),
             current_block: None,
+            externals: BTreeMap::new(),
             max_registers: 256,
+            module: Module::new(),
         }
+    }
+
+    #[inline]
+    pub fn dump_asm(&self) -> String {
+        let mut dump = String::new();
+
+        for block in &self.finalized_blocks {
+            let block = &self.blocks[block];
+
+            dump += &format!("{}\n", block.label);
+
+            for ins in &block.instructions {
+                dump += &format!("\t{}\n", ins);
+            }
+
+            dump += "\n";
+        }
+
+        dump
     }
 
     #[inline]
@@ -187,21 +243,85 @@ impl Compiler {
 
     #[inline]
     pub fn set_block(&mut self, block: Block) {
+        if self.finalized_blocks.contains(&block) {
+            panic!("cannot use finalized blocks");
+        }
+
         self.current_block = Some(block);
     }
 
     #[inline]
+    pub fn current_block(&self) -> Block {
+        self.current_block.expect("current block not set")
+    }
+
+    #[inline]
+    pub fn finalize(&mut self) {
+        let block = self.current_block.take().expect("current block not set");
+
+        self.finalized_blocks.push(block);
+    }
+
+    #[inline]
     pub fn label(&self) -> &String {
-        let block = self.current_block.expect("current block not set");
+        let block = self.current_block();
 
         &self.blocks.get(&block).unwrap().label
     }
 
+    /// Push instruction to the current function
     #[inline]
     pub fn ins(&mut self, ins: Instruction) {
-        let block = self.current_block.expect("current block not set");
+        let block = self.current_block();
 
         self.blocks.get_mut(&block).unwrap().instructions.push(ins);
+    }
+
+    /// Crates an internal function that wraps the external function.
+    #[inline]
+    pub fn compile_external(&mut self, func: &ModFn) {
+        if let FnType::External(id) = func.ty {
+            let mut registers = self.registers();
+
+            // crate block
+            let external = self.create_block(format!("<external {}>", id));
+            self.set_block(external);
+
+            let mut args = Vec::new();
+
+            // push args
+            for i in 0..func.args.len() {
+                let reg = registers.alloc().unwrap();
+
+                self.ins(Instruction::StackAddr(reg, i as i64 * -8 - 8));
+                self.ins(Instruction::Read(reg, reg));
+
+                args.push(reg);
+            }
+
+            for arg in &args {
+                registers.free(*arg);
+            }
+
+            let reg = registers.alloc().unwrap();
+
+            // call the external function
+            self.ins(Instruction::CallExternal(id, reg, args));
+
+            // pop stack
+            for _ in 0..func.args.len() {
+                let reg = registers.alloc().unwrap();
+                self.ins(Instruction::Pop(reg));
+            }
+
+            // return
+            self.ins(Instruction::Return(reg));
+
+            self.finalize();
+
+            // insert external
+            self.externals.insert(id, external);
+        }
     }
 
     #[inline]
@@ -241,6 +361,55 @@ impl Compiler {
                         deref: true,
                         ty: var.ty.clone(),
                     })
+                } else if let Some(func) = self.module.functions.get(&ident.value).cloned() {
+                    match func.ty {
+                        FnType::External(id) => {
+                            if let Some(block) = self.externals.get(&id).cloned() {
+                                let reg = registers.alloc().expect("ran out of registers");
+
+                                self.ins(Instruction::FnAddr(reg, block));
+
+                                Ok(Value {
+                                    reg,
+                                    deref: false,
+                                    ty: Type::Fn(
+                                        func.args.clone(),
+                                        Box::new(func.return_type.clone()),
+                                    ),
+                                })
+                            } else {
+                                let current = self.current_block();
+                                self.compile_external(&func);
+                                self.set_block(current);
+
+                                let block = self.externals[&id];
+
+                                let reg = registers.alloc().expect("ran out of registers");
+
+                                self.ins(Instruction::FnAddr(reg, block));
+
+                                Ok(Value {
+                                    reg,
+                                    deref: false,
+                                    ty: Type::Fn(
+                                        func.args.clone(),
+                                        Box::new(func.return_type.clone()),
+                                    ),
+                                })
+                            }
+                        }
+                        FnType::Internal(block) => {
+                            let reg = registers.alloc().unwrap();
+
+                            self.ins(Instruction::FnAddr(reg, block));
+
+                            Ok(Value {
+                                reg,
+                                deref: false,
+                                ty: Type::Fn(func.args.clone(), Box::new(func.return_type.clone())),
+                            })
+                        }
+                    }
                 } else {
                     Err(CompilerError::new(
                         ident.span(),
@@ -263,8 +432,8 @@ impl Compiler {
                 let reg = registers.alloc().expect("ran out of registers");
 
                 let val = match b {
-                    Bool::True(_) => true,
-                    Bool::False(_) => false,
+                    BoolExpr::True(_) => true,
+                    BoolExpr::False(_) => false,
                 };
 
                 self.ins(Instruction::Init(reg, Word::from_bool(val)));
@@ -279,6 +448,77 @@ impl Compiler {
     }
 
     #[inline]
+    pub fn compile_call_expr(
+        &mut self,
+        call: &CallExpr,
+        scope: &mut Scope,
+        registers: &mut Registers,
+    ) -> Result<Value, CompilerError> {
+        match call {
+            CallExpr::Term(term) => self.compile_term_expr(term, scope, registers),
+            CallExpr::Call(call, call_args) => {
+                let mut callee = self.compile_call_expr(call, scope, registers)?;
+                callee = self.compile_deref(callee);
+
+                if let Type::Fn(ty_args, return_type) = callee.ty {
+                    let mut args = Vec::new();
+
+                    // compile arguments
+                    for (i, arg) in call_args.args.iter().enumerate() {
+                        // compile arg
+                        let mut val = self.compile_expr(arg, scope, registers)?;
+                        val = self.compile_deref(val);
+
+                        // check arg type
+                        if ty_args.get(i) != Some(&val.ty) {
+                            return Err(CompilerError::new(
+                                arg.span(),
+                                format!("expected '{}' found '{}'", ty_args[i], val.ty),
+                            ));
+                        }
+
+                        // push arg
+                        args.push(val.reg);
+                    }
+
+                    for arg in &args {
+                        registers.free(*arg);
+                    }
+
+                    // save allocated registers
+                    for reg in registers.allocated() {
+                        self.ins(Instruction::Push(reg));
+                    }
+
+                    // allocate return value
+                    let reg = registers.alloc().unwrap();
+
+                    // call function
+                    self.ins(Instruction::Call(callee.reg, reg, args));
+
+                    // restore allocated registers
+                    for a_reg in registers.allocated().rev() {
+                        if a_reg != reg {
+                            self.ins(Instruction::Pop(a_reg));
+                        }
+                    }
+
+                    Ok(Value {
+                        ty: *return_type,
+                        deref: false,
+                        reg,
+                    })
+                } else {
+                    Err(CompilerError::new(
+                        call.span(),
+                        format!("cannot call '{}'", callee.ty),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[inline]
     pub fn compile_unary_expr(
         &mut self,
         unary: &UnaryExpr,
@@ -286,7 +526,48 @@ impl Compiler {
         registers: &mut Registers,
     ) -> Result<Value, CompilerError> {
         match unary {
-            UnaryExpr::Term(term) => self.compile_term_expr(term, scope, registers),
+            UnaryExpr::Unary(op, unary) => match op {
+                UnaryOp::Ref(_) => {
+                    let val = self.compile_unary_expr(unary, scope, registers)?;
+
+                    if val.deref {
+                        Ok(Value {
+                            ty: Type::Ptr(Box::new(val.ty)),
+                            deref: false,
+                            reg: val.reg,
+                        })
+                    } else {
+                        scope.push();
+
+                        self.ins(Instruction::Push(val.reg));
+                        self.ins(Instruction::StackAddr(val.reg, -8));
+
+                        Ok(Value {
+                            ty: Type::Ptr(Box::new(val.ty)),
+                            deref: false,
+                            reg: val.reg,
+                        })
+                    }
+                }
+                UnaryOp::Deref(_) => {
+                    let mut val = self.compile_unary_expr(unary, scope, registers)?;
+                    val = self.compile_deref(val);
+
+                    if let Type::Ptr(inner) = val.ty {
+                        Ok(Value {
+                            ty: *inner,
+                            deref: true,
+                            reg: val.reg,
+                        })
+                    } else {
+                        Err(CompilerError::new(
+                            unary.span(),
+                            format!("cannot deref '{}'", val.ty),
+                        ))
+                    }
+                }
+            },
+            UnaryExpr::Call(call) => self.compile_call_expr(call, scope, registers),
         }
     }
 
@@ -349,10 +630,11 @@ impl Compiler {
         let_stmt: &LetStmt,
         scope: &mut Scope,
     ) -> Result<(), CompilerError> {
-        let addr = scope.stack_size * 8;
-
         let mut registers = self.registers();
-        let value = self.compile_expr(&let_stmt.expr, scope, &mut registers)?;
+        let mut value = self.compile_expr(&let_stmt.expr, scope, &mut registers)?;
+        value = self.compile_deref(value);
+
+        let addr = scope.stack_size * 8;
 
         scope.push_variable(
             let_stmt.ident.value.clone(),
@@ -401,16 +683,21 @@ impl Compiler {
     }
 
     #[inline]
-    pub fn compile_block_stmt(&mut self, block_stmt: &BlockStmt) -> Result<(), CompilerError> {
-        let mut scope = Scope::new();
+    pub fn compile_block_stmt(
+        &mut self,
+        block_stmt: &BlockStmt, 
+        scope: &Scope,
+    ) -> Result<bool, CompilerError> {
+        let mut scope = scope.sub();
 
         for stmt in block_stmt.stmts.iter() {
             self.compile_stmt(stmt, &mut scope)?;
         }
 
-        self.pop_scope(&mut scope);
+        let mut registers = self.registers();
+        self.pop_scope(&mut scope, &mut registers); 
 
-        Ok(())
+        Ok(scope.returned)
     }
 
     #[inline]
@@ -431,10 +718,14 @@ impl Compiler {
 
             self.ins(Instruction::Branch(block, end, reg));
 
+            self.finalize();
+
             self.set_block(block);
-            self.compile_block_stmt(&if_stmt.block)?;
+            self.compile_block_stmt(&if_stmt.block, scope)?;
             self.ins(Instruction::Comment(String::from("jump to end")));
             self.ins(Instruction::Jump(end));
+
+            self.finalize();
 
             self.set_block(end);
 
@@ -442,9 +733,39 @@ impl Compiler {
         } else {
             Err(CompilerError::new(
                 if_stmt.expr.span(),
-                format!("expected '{}' found '{}'", Type::Bool, val.ty,),
+                format!("expected '{}' found '{}'", Type::Bool, val.ty),
             ))
         }
+    }
+
+    #[inline]
+    pub fn compile_return_stmt(
+        &mut self,
+        return_stmt: &ReturnStmt,
+        scope: &mut Scope,
+    ) -> Result<(), CompilerError> {
+        let mut registers = self.registers();
+
+        let mut val = self.compile_expr(&return_stmt.expr, scope, &mut registers)?;
+        val = self.compile_deref(val);
+
+        if val.ty != scope.return_type {
+            return Err(CompilerError::new(
+                return_stmt.span(),
+                format!(
+                    "expected return type '{}' found '{}",
+                    scope.return_type, val.ty
+                ),
+            ));
+        }
+
+        self.pop_stack(scope, &mut registers);
+
+        self.ins(Instruction::Return(val.reg));
+
+        scope.returned = true;
+
+        Ok(())
     }
 
     #[inline]
@@ -453,15 +774,108 @@ impl Compiler {
             Stmt::Let(let_stmt) => self.compile_let_stmt(let_stmt, scope),
             Stmt::Assign(assign_stmt) => self.compile_assign_stmt(assign_stmt, scope),
             Stmt::If(if_stmt) => self.compile_if_stmt(if_stmt, scope),
+            Stmt::Expr(expr, _) => {
+                let mut registers = self.registers();
+
+                self.compile_expr(expr, scope, &mut registers)?;
+
+                Ok(())
+            }
+            Stmt::Fn(fn_decl) => self.compile_function(fn_decl),
+            Stmt::Return(return_stmt) => self.compile_return_stmt(return_stmt, scope),
         }
     }
 
     #[inline]
-    pub fn pop_scope(&mut self, scope: &mut Scope) {
-        let mut registers = self.registers();
+    pub fn compile_function(&mut self, func: &FnDecl) -> Result<(), CompilerError> {
+        let mut scope = Scope::new();
+
+        // register variables in scope
+        for (i, arg) in func.args.iter().rev().enumerate() {
+            scope.push_variable(
+                arg.ident.value.clone(),
+                Variable {
+                    ty: arg.ty.as_type(),
+                    addr: i as u64 * 8,
+                },
+            );
+        }
+
+        let current = self.current_block();
+
+        let mod_fn = self.module.functions.get(&func.ident.value).unwrap();
+        scope.return_type = mod_fn.return_type.clone();
+
+        let block = if let FnType::Internal(block) = mod_fn.ty {
+            block
+        } else {
+            unreachable!()
+        };
+
+        // create function block
+        self.set_block(block);
+
+        // compile function block
+        scope.returned = self.compile_block_stmt(&func.block, &scope)?;
+
+        if !scope.returned {
+            // compile stack
+            if scope.return_type != Type::Void {
+                return Err(CompilerError::new(
+                    func.block.span(),
+                    format!(
+                        "expected return type '{}' found '{}",
+                        scope.return_type,
+                        Type::Void
+                    ),
+                ));
+            }
+
+            let mut registers = self.registers();
+            self.pop_stack(&mut scope, &mut registers);
+
+            // return from function
+            let mut registers = self.registers();
+            let reg = registers.alloc().unwrap();
+            self.ins(Instruction::Return(reg));
+        } 
+
+        self.finalize();
+        self.set_block(current);
+
+        Ok(())
+    }
+
+    #[inline]
+    pub fn prepare_fn(&mut self, fn_decl: &FnDecl) {
+        let args = fn_decl.args.iter().map(|arg| arg.ty.as_type()).collect();
+
+        let return_type = fn_decl
+            .return_type
+            .as_ref()
+            .map(|rt| rt.ty.as_type())
+            .unwrap_or(Type::Void);
+
+        let block = self.create_block(&fn_decl.ident.value);
+        self.module
+            .insert_function(&fn_decl.ident.value, ModFn::new(block, args, return_type));
+    }
+
+    #[inline]
+    pub fn prepare_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Fn(fn_decl) => self.prepare_fn(fn_decl),
+            _ => {}
+        }
+    }
+
+    #[inline]
+    pub fn pop_scope(&mut self, scope: &mut Scope, registers: &mut Registers) {
         let reg = registers.alloc().expect("ran out of registers");
 
-        self.ins(Instruction::Comment(String::from("pop scope stack")));
+        if scope.local_size > 0 {
+            self.ins(Instruction::Comment(String::from("pop scope stack")));
+        }
 
         for _ in 0..scope.local_size {
             self.ins(Instruction::Pop(reg));
@@ -469,11 +883,12 @@ impl Compiler {
     }
 
     #[inline]
-    pub fn pop_stack(&mut self, scope: &mut Scope) {
-        let mut registers = self.registers();
+    pub fn pop_stack(&mut self, scope: &mut Scope, registers: &mut Registers) {
         let reg = registers.alloc().expect("ran out of registers");
 
-        self.ins(Instruction::Comment(String::from("pop stack")));
+        if scope.stack_size > 0 {
+            self.ins(Instruction::Comment(String::from("pop stack")));
+        }
 
         for _ in 0..scope.stack_size {
             self.ins(Instruction::Pop(reg));

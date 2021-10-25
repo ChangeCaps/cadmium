@@ -1,5 +1,7 @@
 use lasagna::*;
 
+use crate::Type;
+
 #[derive(Named, Clone, Debug, PartialEq, Eq, Hash)]
 #[name = "identifier"]
 pub struct Ident {
@@ -153,6 +155,8 @@ pub enum CadmiumToken {
     OpenParen,
     #[token = ")"]
     CloseParen,
+    #[token = "->"]
+    Arrow,
     #[token = "=="]
     EqualEqual,
     #[token = "!="]
@@ -193,6 +197,20 @@ pub enum CadmiumToken {
     True,
     #[token = "false"]
     False,
+    #[token = "fn"]
+    FnTok,
+    #[token = "return"]
+    Return,
+
+    // type keywords
+    #[token = "i32"]
+    I32,
+    #[token = "f32"]
+    F32,
+    #[token = "bool"]
+    Bool,
+    #[token = "void"]
+    Void,
 
     // misc
     #[token]
@@ -204,6 +222,28 @@ pub enum CadmiumToken {
 }
 
 #[derive(Parse, Spanned, Clone, Debug)]
+pub enum AstType {
+    I32(I32),
+    F32(F32),
+    Bool(Bool),
+    Void(Void),
+    Ptr(Asterisk, Box<AstType>),
+}
+
+impl AstType {
+    #[inline]
+    pub fn as_type(&self) -> Type {
+        match self {
+            Self::I32(_) => Type::I32,
+            Self::F32(_) => Type::F32,
+            Self::Bool(_) => Type::Bool,
+            Self::Void(_) => Type::Void,
+            Self::Ptr(_, inner) => Type::Ptr(Box::new(inner.as_type())),
+        }
+    }
+}
+
+#[derive(Parse, Spanned, Clone, Debug)]
 pub struct ParenExpr {
     pub open: OpenParen,
     pub expr: Expr,
@@ -211,7 +251,7 @@ pub struct ParenExpr {
 }
 
 #[derive(Parse, Spanned, Clone, Debug)]
-pub enum Bool {
+pub enum BoolExpr {
     True(True),
     False(False),
 }
@@ -221,12 +261,47 @@ pub enum TermExpr {
     Paren(Box<ParenExpr>),
     Variable(Ident),
     Integer(Integer),
-    Bool(Bool),
+    Bool(BoolExpr),
+}
+
+#[derive(Parse, Spanned, Clone, Debug)]
+pub struct CallArgs {
+    pub open: OpenParen,
+    pub args: Punctuated<Expr, Comma>,
+    pub close: CloseParen,
+}
+
+#[derive(Spanned, Clone, Debug)]
+pub enum CallExpr {
+    Call(Box<CallExpr>, CallArgs),
+    Term(TermExpr),
+}
+
+impl Parse for CallExpr {
+    type Source = CadmiumToken;
+
+    #[inline]
+    fn parse(parser: &mut impl Parser<Source = Self::Source>) -> Result<Self, ParseError> {
+        let mut expr = CallExpr::Term(parser.parse()?);
+
+        while let Some(args) = parser.try_parse::<CallArgs>() {
+            expr = CallExpr::Call(Box::new(expr), args);
+        }
+
+        Ok(expr)
+    }
+}
+
+#[derive(Parse, Spanned, Clone, Debug)]
+pub enum UnaryOp {
+    Ref(And),
+    Deref(Asterisk),
 }
 
 #[derive(Parse, Spanned, Clone, Debug)]
 pub enum UnaryExpr {
-    Term(TermExpr),
+    Unary(UnaryOp, Box<UnaryExpr>),
+    Call(CallExpr),
 }
 
 #[derive(Parse, Spanned, Clone, Debug)]
@@ -362,18 +437,49 @@ pub struct AssignStmt {
 }
 
 #[derive(Parse, Spanned, Clone, Debug)]
+pub struct FnArg {
+    pub ident: Ident,
+    pub colon: Colon,
+    pub ty: AstType,
+}
+
+#[derive(Parse, Spanned, Clone, Debug)]
+pub struct ReturnType {
+    pub arrow: Arrow,
+    pub ty: AstType,
+}
+
+#[derive(Parse, Spanned, Clone, Debug)]
+pub struct FnDecl {
+    pub fn_: FnTok,
+    pub ident: Ident,
+    pub open: OpenParen,
+    pub args: Punctuated<FnArg, Comma>,
+    pub close: CloseParen,
+    pub return_type: SpannedOption<ReturnType>,
+    pub block: BlockStmt,
+}
+
+#[derive(Parse, Spanned, Clone, Debug)]
+pub struct ReturnStmt {
+    pub return_: Return,
+    pub expr: Expr,
+    pub semi_colon: SemiColon,
+}
+
+#[derive(Parse, Spanned, Clone, Debug)]
 pub enum Stmt {
     #[parse(peek = Let)]
     Let(LetStmt),
     Assign(AssignStmt),
     #[parse(peek = If)]
     If(IfStmt),
+    Expr(Expr, SemiColon),
+    #[parse(peek = FnTok)]
+    Fn(FnDecl),
+    #[parse(peek = Return)]
+    Return(ReturnStmt),
 }
-
-/*
-#[derive(Parse, Clone, Debug)]
-pub enum Decl {}
-*/
 
 #[derive(Parse, Clone, Debug)]
 pub struct AstProgram {

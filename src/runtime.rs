@@ -1,5 +1,8 @@
-use crate::{AstProgram, Block, CompiledBlock, Compiler, Scope};
-use std::collections::BTreeMap;
+use crate::{AstProgram, Block, CompiledBlock, Compiler, Module, Scope};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -92,6 +95,11 @@ impl Word {
     }
 
     #[inline]
+    pub fn from_block(block: Block) -> Self {
+        Self::from_u64(block.to_u64())
+    }
+
+    #[inline]
     pub fn as_f32(self) -> f32 {
         unsafe { std::mem::transmute([self.0[4], self.0[5], self.0[6], self.0[7]]) }
     }
@@ -119,6 +127,11 @@ impl Word {
     #[inline]
     pub fn as_bool(self) -> bool {
         self.0[7] != 0
+    }
+
+    #[inline]
+    pub fn to_block(self) -> Block {
+        Block::from_u64(self.as_u64())
     }
 }
 
@@ -148,6 +161,7 @@ pub enum Instruction {
     // register
     Mov(Register, Register),
     Init(Register, Word),
+    FnAddr(Register, Block),
 
     // integer
     IAdd(Register, Register, Register),
@@ -160,6 +174,9 @@ pub enum Instruction {
     JumpNZ(Block, Register),
     Branch(Block, Block, Register),
     Exit(Register),
+    Call(Register, Register, Vec<Register>),
+    CallExternal(u64, Register, Vec<Register>),
+    Return(Register),
 
     // debug
     Comment(String),
@@ -176,6 +193,7 @@ impl std::fmt::Display for Instruction {
             Self::Write(dst, src) => write!(f, "write {} {}", dst, src),
             Self::Mov(dst, src) => write!(f, "mov {} {}", dst, src),
             Self::Init(dst, src) => write!(f, "init {} {}", dst, src),
+            Self::FnAddr(dst, block) => write!(f, "faddr {} {}", dst, block),
             Self::IAdd(dst, lhs, rhs) => write!(f, "iadd {} {} {}", dst, lhs, rhs),
             Self::ISub(dst, lhs, rhs) => write!(f, "isub {} {} {}", dst, lhs, rhs),
             Self::IMul(dst, lhs, rhs) => write!(f, "imul {} {} {}", dst, lhs, rhs),
@@ -186,6 +204,27 @@ impl std::fmt::Display for Instruction {
                 write!(f, "br {} {} {}", block_true, block_false, src)
             }
             Self::Exit(src) => write!(f, "exit {}", src),
+            Self::Call(func, dst, args) => {
+                write!(f, "call {} {}", func, dst)?;
+
+                for arg in args {
+                    write!(f, " {}", arg)?;
+                }
+
+                Ok(())
+            }
+            Self::CallExternal(id, dst, args) => {
+                write!(f, "callex {} {}", id, dst)?;
+
+                for arg in args {
+                    write!(f, " {}", arg)?;
+                }
+
+                Ok(())
+            }
+            Self::Return(src) => {
+                write!(f, "ret {}", src)
+            }
             Self::Comment(comment) => write!(f, "// {}", comment),
         }
     }
@@ -193,9 +232,13 @@ impl std::fmt::Display for Instruction {
 
 #[derive(Clone)]
 pub struct Runtime {
+    pub externals: HashMap<u64, Arc<dyn Fn(&mut Runtime, Vec<Word>) -> Word>>,
     pub block: Block,
     pub inst: usize,
     pub registers: [Word; 256],
+    pub return_reg: Register,
+    pub return_block: Block,
+    pub return_inst: usize,
     pub stack_pointer: usize,
     pub memory: Vec<u8>,
 }
@@ -204,9 +247,13 @@ impl Runtime {
     #[inline]
     pub fn new() -> Self {
         Self {
+            externals: HashMap::new(),
             block: Block::from_u64(0),
             inst: 0,
             registers: [Word::ZERO; 256],
+            return_reg: Register::from_u8(0),
+            return_block: Block::from_u64(0),
+            return_inst: 0,
             stack_pointer: 0,
             memory: Vec::new(),
         }
@@ -246,15 +293,20 @@ impl Runtime {
     }
 
     #[inline]
+    pub fn pop(&mut self) -> Word {
+        self.stack_pointer -= 8;
+
+        self.read_mem(self.stack_pointer)
+    }
+
+    #[inline]
     pub fn eval(&mut self, inst: &Instruction) -> Option<i32> {
         match *inst {
             Instruction::Push(src) => {
                 self.push(self.read_reg(src));
             }
             Instruction::Pop(dst) => {
-                self.stack_pointer -= 8;
-
-                let val = self.read_mem(self.stack_pointer);
+                let val = self.pop();
 
                 self.write_reg(dst, val);
             }
@@ -266,11 +318,13 @@ impl Runtime {
             Instruction::Read(dst, src) => {
                 let ptr = self.read_reg(src);
                 let word = self.read_mem(ptr.as_u64() as usize);
+
                 self.write_reg(dst, word);
             }
             Instruction::Write(dst, src) => {
                 let ptr = self.read_reg(dst);
                 let word = self.read_reg(src);
+
                 self.write_mem(ptr.as_u64() as usize, word);
             }
             Instruction::Mov(dst, src) => {
@@ -280,6 +334,9 @@ impl Runtime {
             }
             Instruction::Init(dst, val) => {
                 self.write_reg(dst, val);
+            }
+            Instruction::FnAddr(dst, block) => {
+                self.write_reg(dst, Word::from_u64(block.to_u64()));
             }
             Instruction::IAdd(dst, lhs, rhs) => {
                 let res = self.read_reg(lhs).as_i64() + self.read_reg(rhs).as_i64();
@@ -325,6 +382,54 @@ impl Runtime {
 
                 return Some(exit_code.as_i32());
             }
+            Instruction::Call(func, dst, ref args) => {
+                // read function block
+                let func = self.read_reg(func).to_block();
+
+                // save return point
+                self.push(Word::from_block(self.return_block));
+                self.push(Word::from_u64(self.return_inst as u64));
+
+                // set return register
+                self.return_reg = dst;
+
+                // point args onto the stack
+                for arg in args.iter().rev() {
+                    self.push(self.read_reg(*arg));
+                }
+
+                // set return point
+                self.return_block = self.block;
+                self.return_inst = self.inst;
+
+                // jump to function
+                self.block = func;
+                self.inst = 0;
+            }
+            Instruction::CallExternal(id, dst, ref args) => {
+                // fetch external function
+                let func = self.externals[&id].clone();
+
+                // collect arguments
+                let args = args.iter().map(|reg| self.read_reg(*reg)).collect();
+
+                // call external function
+                let res = func(self, args);
+
+                self.write_reg(dst, res);
+            }
+            Instruction::Return(src) => {
+                // write return value
+                self.write_reg(self.return_reg, self.read_reg(src));
+
+                // jump to return point
+                self.block = self.return_block;
+                self.inst = self.return_inst;
+
+                // restore return point
+                self.return_inst = self.pop().as_u64() as usize;
+                self.return_block = self.pop().to_block();
+            }
             Instruction::Comment(_) => {}
         }
 
@@ -351,19 +456,33 @@ impl Runtime {
 
 #[derive(Clone, Debug)]
 pub struct JitProgram {
+    pub asm: String,
     pub blocks: BTreeMap<Block, CompiledBlock>,
     pub main_block: Block,
 }
 
 impl JitProgram {
     #[inline]
-    pub fn compile(source: &str) -> Result<Self, anyhow::Error> {
+    pub fn compile(source: &str, module: Module) -> Result<Self, anyhow::Error> {
         let program = AstProgram::parse(&source)?;
 
+        // set up compiler
         let mut compiler = Compiler::new();
 
+        // pre compile externals for nicer asm dumps
+        for func in module.functions.values() {
+            compiler.compile_external(func);
+        }
+
+        compiler.module = module;
+
+        // compile main
         let main = compiler.create_block("main");
         compiler.set_block(main);
+
+        for stmt in program.stmts.iter() {
+            compiler.prepare_stmt(stmt);
+        }
 
         let mut scope = Scope::new();
 
@@ -371,9 +490,9 @@ impl JitProgram {
             compiler.compile_stmt(stmt, &mut scope)?;
         }
 
-        compiler.pop_stack(&mut scope);
-
         let mut registers = compiler.registers();
+        compiler.pop_stack(&mut scope, &mut registers);
+
         let reg = registers.alloc().expect("ran out of registers");
 
         // exit program
@@ -381,7 +500,10 @@ impl JitProgram {
         compiler.ins(Instruction::Init(reg, Word::from_i64(0)));
         compiler.ins(Instruction::Exit(reg));
 
+        compiler.finalize();
+
         Ok(Self {
+            asm: compiler.dump_asm(),
             blocks: compiler.blocks,
             main_block: main,
         })
@@ -389,12 +511,6 @@ impl JitProgram {
 
     #[inline]
     pub fn dump(&self) {
-        for block in self.blocks.values() {
-            println!("{}:", block.label);
-
-            for instruction in &block.instructions {
-                println!("\t{}", instruction);
-            }
-        }
+        println!("{}", self.asm);
     }
 }
